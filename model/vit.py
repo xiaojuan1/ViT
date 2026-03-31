@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-
+from functools import partial
+from collections import OrderedDict
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=224,patch_size=16,in_c=3,embed_dim=768,norm_layer=None):
@@ -151,3 +152,133 @@ class Block(nn.Module):
         x=x+self.drop_path(self.attn(self.norm1(x)))#多头注意力层的输出加上输入,形成残差连接,并通过drop_path进行随机丢弃
         x=x+self.drop_path(self.mlp(self.norm2(x)))#MLP层的输出加上输入,形成残差连接,并通过drop_path进行随机丢弃
         return x
+class VisionTransformer(nn.Module):
+    def __init__(self,
+                 img_size=224,
+                 patch_size=16,
+                 in_c=3,
+                 num_classes=1000,
+                 embed_dim=768,
+                 depth=12,#transformer encoderd的层数
+                 num_heads=8,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 representation_size=None,#如果不为None,则在分类头之前添加一个线性层,将嵌入维度转换为representation_size
+                 distilled=False,#是否使用蒸馏token,如果为True,则在输入中添加一个额外的token用于蒸馏训练???不太懂蒸馏训练
+                 drop_ratio=0.,
+                 attn_drop=0.,
+                 drop_path_ratio=0.,
+                 embed_layer=PatchEmbed,
+                 norm_layer=nn.LayerNorm,
+                 act_layer=None):
+        super(VisionTransformer,self).__init__()
+        self.num_classes=num_classes
+        self.num_features=self.embed_dim=embed_dim
+        self.num_tokens=2 if distilled else 1#如果使用蒸馏num_tokens=2,否则为1
+        #设置一个比较小的参数防止除以0
+        norm_layer=norm_layer or partial(nn.LayerNorm,eps=1e-6)#如果没有指定norm_layer,则使用LayerNorm,并设置eps参数为1e-6
+        act_layer=act_layer or nn.GELU#如果没有指定act_layer,则使用GELU激活函数
+        self.patch_embed=embed_layer(img_size=img_size,patch_size=patch_size,in_c=in_c,embed_dim=embed_dim,norm_layer=norm_layer)#实例化patch embedding层
+        num_patches=self.patch_embed.num_patchs#计算patch的数量14 *14=196
+        #使用nn.Parameter构建可训练的参数用于零矩阵初始化目的一个是batch维度,另一个是token维度,最后一个是嵌入维度
+        self.cls_token=nn.Parameter(torch.zeros(1,1,embed_dim))#分类token,形状为1,1,embed_dim
+        self.dist_token=nn.Parameter(torch.zeros(1,1,embed_dim)) if distilled else None#蒸馏token,如果使用蒸馏则形状为1,1,embed_dim,否则为None这里面我们不会用到
+        #pos_embed大小与concat拼接后的大小一致,197 768
+        self.pos_embed=nn.Parameter(torch.zeros(1,num_patches+self.num_tokens,embed_dim))#位置编码,形状为1(占位符),num_patches+num_tokens,embed_dim
+        self.pos_embed_drop=nn.Dropout(drop_ratio)#位置编码的dropout层
+        # 根据传入的drop_path_ratio构建等差序列从0到drop_path_ratio，有depth个元素.浅层不丢弃深层才丢弃 
+        dpr = [x.item() for x in torch.linspace(0, drop_path_ratio, depth)]  # stochastic depth decay rule
+        #使用nn.Sequential将列表中所有模块打包成一个整体
+        self.block=nn.Sequential(*[
+            Block(dim=embed_dim,num_heads=num_heads,mlp_ratio=mlp_ratio,qkv_bias=qkv_bias,qk_scale=qk_scale,
+                  drop_ratio=drop_ratio,attn_drop=attn_drop,drop_path=dpr[i],norm_layer=norm_layer,act_layer=act_layer)
+            for i in range(depth)
+        ])
+
+        self.norm=norm_layer(embed_dim)#通过transformer的layernormer
+        #要不要在最终分类前，加一个“表示层”
+        #如果用了 pre_logits，那后面模型真正拿来分类的特征维度就不再是 embed_dim，而是：representation_size
+        if representation_size and not distilled:
+            self.has_logits = True
+            self.num_features = representation_size
+            self.pre_logits = nn.Sequential(OrderedDict([
+                ("fc",nn.Linear(embed_dim,representation_size)),
+                ("act",nn.Tanh())
+            ]))
+        else:
+            self.has_logits=False
+            self.pre_logits=nn.Identity() # pre_logits不做任何处理
+        #分类头
+        self.head=nn.Linear(self.num_features,num_classes) if num_classes>0 else nn.Identity()#分类头,如果num_classes大于0,则使用线性层,否则使用Identity不做任何处理
+        # self.head_dist = None
+        # if distilled:
+        #     self.head_dist = nn.Linear(self.embed_dim,self.num_classes) if num_classes>0 else nn.Identity()
+
+        # 权重初始化
+        nn.init.trunc_normal_(self.pos_embed,std=0.02)
+        if self.dist_token is not None:
+            nn.init.trunc_normal_(self.dist_token,std=0.02)
+        
+        nn.init.trunc_normal_(self.cls_token,std=0.02)
+        self.apply(_init_vit_weights)
+
+    def forward_features(self,x):
+        # B C H W -> B num_patches embed_dim
+        x = self.patch_embed(x)
+        # 1,1,768->B,1,768
+        cls_token = self.cls_token.expand(x.shape[0],-1,-1)
+        # 如果dist_token存在则拼接dist_token和cls_token,否则只拼接cls_token和输入的patch特征x
+        if self.dist_token is None:
+            x = torch.cat((cls_token,x),dim=1) # B 197 768 在维度1上面拼接
+        else:
+            x = torch.cat((cls_token,self.dist_token.expand(x.shape[0],-1,-1),x),dim=1)
+        
+        x = self.pos_drop(x+self.pos_embed)
+        x = self.block(x)
+        x = self.norm(x)
+        if self.dist_token is None: # dist_token为None 提取cls_token对应的输出
+            return self.pre_logits(x[:,0])
+        else:
+            return x[:,0],x[:,1]#CLS Token 的输出（代表整张图像的特征）Dist Token 的输出（用于蒸馏）
+        
+    def forward(self,x):
+        x = self.forward_features(x)
+        if self.head_dist is not None:
+            # 分别通过head和head-dist进行预测
+            x , x_dist = self.head(x[0]),self.head_dist(x[1])
+            # 如果是训练模式且不是脚本模式
+            if self.training and not torch.jit.is_scripting():
+                # 则返回两个头部的预测结果
+                return x ,x_dist
+        else:
+            x = self.head(x) # 最后的linear 全连接层
+        return x 
+    
+    
+def _init_vit_weights(m):
+    # 判断模块m是否是nn.linear
+    if isinstance(m,nn.Linear):
+        nn.init.trunc_normal_(m.weight,std=.01)
+        if m.bias is not None: # 如果线性层存在偏置项
+            nn.init.zeros_(m.bias)
+
+    elif isinstance(m,nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight,mode="fan_out") # 对卷积层的权重做一个初始化 适用于卷积
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    elif isinstance(m,nn.LayerNorm):
+        nn.init.zeros_(m.bias)
+        nn.init.ones_(m.weight) # 对层归一化的权重初始化为1
+
+def vit_base_patch16_224(num_classes:int = 1000,pretrained=False):
+    model = VisionTransformer(img_size=224,
+                              patch_size=16,
+                              embed_dim=768,
+                              depth=12,
+                              num_heads=12,
+                              representation_size=None,
+                              num_classes=num_classes)
+    return model
+
